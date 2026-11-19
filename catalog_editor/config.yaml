@@ -2,7 +2,7 @@ name: "Entity Catalog Editor"
 version: "0.1.0"
 slug: "catalog_editor"
 description: "HAのエンティティをチェックリストで選んで entity_catalog.yaml を更新する"
-arch: [aarch64, amd64, armv7]
+arch: [aarch64, amd64]
 init: false
 startup: application
 boot: auto
