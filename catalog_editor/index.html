@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Entity Catalog</title>
+<style>
+:root{--bg:#fafafa;--fg:#1c1c1e;--card:#fff;--line:#e0e0e0;--accent:#03a9f4;--warn:#e65100;--mute:#757575}
+@media (prefers-color-scheme:dark){:root{--bg:#111;--fg:#e8e8e8;--card:#1c1c1c;--line:#333;--warn:#ffb74d;--mute:#9e9e9e}}
+*{box-sizing:border-box}
+body{margin:0;font:15px/1.4 system-ui,sans-serif;background:var(--bg);color:var(--fg);padding-bottom:70px}
+header{position:sticky;top:0;background:var(--bg);padding:10px 12px;border-bottom:1px solid var(--line);z-index:5}
+input[type=search]{width:100%;padding:9px 10px;font-size:16px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--fg)}
+.opts{display:flex;gap:14px;margin-top:6px;font-size:13px;color:var(--mute)}
+details{background:var(--card);margin:8px 12px;border:1px solid var(--line);border-radius:10px}
+summary{padding:10px 12px;cursor:pointer;display:flex;justify-content:space-between;align-items:center;font-weight:600}
+summary .n{font-weight:400;color:var(--mute);font-size:13px}
+.row{display:flex;gap:10px;padding:8px 12px;border-top:1px solid var(--line);align-items:flex-start}
+.row input{width:20px;height:20px;margin-top:2px;accent-color:var(--accent);flex:none}
+.row label{flex:1;min-width:0;word-break:break-all}
+.id{font-size:12px;color:var(--mute)}
+.warn{color:var(--warn);font-size:12px;font-weight:600}
+.tog{padding:6px 12px;font-size:13px;color:var(--accent);cursor:pointer;border-top:1px solid var(--line)}
+footer{position:fixed;bottom:0;left:0;right:0;padding:10px 12px;background:var(--card);border-top:1px solid var(--line);display:flex;justify-content:space-between;align-items:center;gap:10px}
+button{background:var(--accent);color:#fff;border:0;border-radius:8px;padding:10px 20px;font-size:15px;font-weight:600}
+#msg{font-size:13px;color:var(--mute)}
+</style>
+</head>
+<body>
+<header>
+  <input type="search" id="q" placeholder="検索 (名前 / entity_id)">
+  <div class="opts"><label><input type="checkbox" id="onlySel"> 選択済みのみ</label><span id="path"></span></div>
+</header>
+<main id="list"></main>
+<footer><span id="msg"></span><button id="save">保存</button></footer>
+<script>
+let ALL = [], SEL = new Set(), WARN = [];
+const $ = s => document.querySelector(s);
+const domain = id => id.split('.')[0];
+
+async function init() {
+  const r = await fetch('api/entities');
+  const d = await r.json();
+  ALL = d.entities; WARN = d.warn_domains; SEL = new Set(d.selected);
+  $('#path').textContent = d.path.split('/').slice(-2).join('/');
+  render();
+}
+
+function render() {
+  const q = $('#q').value.toLowerCase(), only = $('#onlySel').checked;
+  const open = new Set([...document.querySelectorAll('details[open]')].map(x => x.dataset.d));
+  const groups = {};
+  for (const e of ALL) {
+    if (only && !SEL.has(e.id)) continue;
+    if (q && !(e.id.toLowerCase().includes(q) || e.name.toLowerCase().includes(q))) continue;
+    (groups[domain(e.id)] ||= []).push(e);
+  }
+  const list = $('#list'); list.textContent = '';
+  for (const dom of Object.keys(groups).sort()) {
+    const items = groups[dom];
+    const det = document.createElement('details'); det.dataset.d = dom;
+    if (q || only || open.has(dom)) det.open = true;
+    const sum = document.createElement('summary');
+    const t = document.createElement('span');
+    t.textContent = dom + (WARN.includes(dom) ? ' ⚠' : '');
+    const n = document.createElement('span'); n.className = 'n';
+    n.textContent = items.filter(e => SEL.has(e.id)).length + ' / ' + items.length;
+    sum.append(t, n); det.append(sum);
+    const tog = document.createElement('div'); tog.className = 'tog';
+    tog.textContent = '表示中をすべて選択 / 解除';
+    tog.onclick = () => {
+      const all = items.every(e => SEL.has(e.id));
+      items.forEach(e => all ? SEL.delete(e.id) : SEL.add(e.id));
+      render();
+    };
+    det.append(tog);
+    for (const e of items) {
+      const row = document.createElement('div'); row.className = 'row';
+      const cb = document.createElement('input'); cb.type = 'checkbox'; cb.id = 'c_' + e.id;
+      cb.checked = SEL.has(e.id);
+      cb.onchange = () => { cb.checked ? SEL.add(e.id) : SEL.delete(e.id); count(); };
+      const lb = document.createElement('label'); lb.htmlFor = cb.id;
+      const nm = document.createElement('div'); nm.textContent = e.name || e.id;
+      const id = document.createElement('div'); id.className = 'id'; id.textContent = e.id;
+      lb.append(nm, id);
+      if (WARN.includes(dom)) {
+        const w = document.createElement('div'); w.className = 'warn';
+        w.textContent = '物理的な影響あり: AIに操作させてよいか確認'; lb.append(w);
+      }
+      if (e.missing) {
+        const m = document.createElement('div'); m.className = 'warn';
+        m.textContent = 'HAに存在しません (YAMLにのみ残っています)'; lb.append(m);
+      }
+      row.append(cb, lb); det.append(row);
+    }
+    list.append(det);
+  }
+  count();
+}
+
+function count() { $('#msg').textContent = SEL.size + ' 件選択中'; }
+
+$('#q').oninput = render;
+$('#onlySel').onchange = render;
+$('#save').onclick = async () => {
+  const b = $('#save'); b.disabled = true; $('#msg').textContent = '保存中…';
+  try {
+    const r = await fetch('api/save', {method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({selected: [...SEL]})});
+    if (!r.ok) throw new Error(await r.text());
+    const d = await r.json();
+    $('#msg').textContent = d.count + ' 件を保存しました';
+  } catch (e) { $('#msg').textContent = '保存失敗: ' + e.message; }
+  b.disabled = false;
+};
+init().catch(e => { $('#msg').textContent = '読み込み失敗: ' + e.message; });
+</script>
+</body>
+</html>
