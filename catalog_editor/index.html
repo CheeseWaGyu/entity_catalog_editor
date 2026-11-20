@@ -15,11 +15,14 @@ input[type=search]{width:100%;padding:9px 10px;font-size:16px;border:1px solid v
 details{background:var(--card);margin:8px 12px;border:1px solid var(--line);border-radius:10px}
 summary{padding:10px 12px;cursor:pointer;display:flex;justify-content:space-between;align-items:center;font-weight:600}
 summary .n{font-weight:400;color:var(--mute);font-size:13px}
-.row{display:flex;gap:10px;padding:8px 12px;border-top:1px solid var(--line);align-items:flex-start}
+.row{display:flex;gap:10px;padding:8px 12px;border-top:1px solid var(--line);align-items:flex-start;flex-wrap:wrap}
 .row input{width:20px;height:20px;margin-top:2px;accent-color:var(--accent);flex:none}
 .row label{flex:1;min-width:0;word-break:break-all}
 .id{font-size:12px;color:var(--mute)}
 .warn{color:var(--warn);font-size:12px;font-weight:600}
+.descbox{flex-basis:100%;margin-left:30px}
+.descbox textarea{width:100%;padding:7px 9px;font-size:14px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--fg);resize:vertical}
+.descbox .hint{font-size:12px;color:var(--mute);margin-top:2px}
 .tog{padding:6px 12px;font-size:13px;color:var(--accent);cursor:pointer;border-top:1px solid var(--line)}
 footer{position:fixed;bottom:0;left:0;right:0;padding:10px 12px;background:var(--card);border-top:1px solid var(--line);display:flex;justify-content:space-between;align-items:center;gap:10px}
 button{background:var(--accent);color:#fff;border:0;border-radius:8px;padding:10px 20px;font-size:15px;font-weight:600}
@@ -28,13 +31,13 @@ button{background:var(--accent);color:#fff;border:0;border-radius:8px;padding:10
 </head>
 <body>
 <header>
-  <input type="search" id="q" placeholder="検索 (名前 / entity_id)">
+  <input type="search" id="q" placeholder="検索 (名前 / entity_id / 説明)">
   <div class="opts"><label><input type="checkbox" id="onlySel"> 選択済みのみ</label><span id="path"></span></div>
 </header>
 <main id="list"></main>
 <footer><span id="msg"></span><button id="save">保存</button></footer>
 <script>
-let ALL = [], SEL = new Set(), WARN = [];
+let ALL = [], SEL = new Set(), WARN = [], DESC = {};
 const $ = s => document.querySelector(s);
 const domain = id => id.split('.')[0];
 
@@ -42,6 +45,7 @@ async function init() {
   const r = await fetch('api/entities');
   const d = await r.json();
   ALL = d.entities; WARN = d.warn_domains; SEL = new Set(d.selected);
+  DESC = {}; for (const e of ALL) DESC[e.id] = e.description || '';
   $('#path').textContent = d.path.split('/').slice(-2).join('/');
   render();
 }
@@ -52,7 +56,7 @@ function render() {
   const groups = {};
   for (const e of ALL) {
     if (only && !SEL.has(e.id)) continue;
-    if (q && !(e.id.toLowerCase().includes(q) || e.name.toLowerCase().includes(q))) continue;
+    if (q && !(e.id.toLowerCase().includes(q) || e.name.toLowerCase().includes(q) || (DESC[e.id] || '').toLowerCase().includes(q))) continue;
     (groups[domain(e.id)] ||= []).push(e);
   }
   const list = $('#list'); list.textContent = '';
@@ -78,7 +82,11 @@ function render() {
       const row = document.createElement('div'); row.className = 'row';
       const cb = document.createElement('input'); cb.type = 'checkbox'; cb.id = 'c_' + e.id;
       cb.checked = SEL.has(e.id);
-      cb.onchange = () => { cb.checked ? SEL.add(e.id) : SEL.delete(e.id); count(); };
+      cb.onchange = () => {
+        cb.checked ? SEL.add(e.id) : SEL.delete(e.id);
+        row.querySelector('.descbox').hidden = !cb.checked;
+        count();
+      };
       const lb = document.createElement('label'); lb.htmlFor = cb.id;
       const nm = document.createElement('div'); nm.textContent = e.name || e.id;
       const id = document.createElement('div'); id.className = 'id'; id.textContent = e.id;
@@ -91,7 +99,17 @@ function render() {
         const m = document.createElement('div'); m.className = 'warn';
         m.textContent = 'HAに存在しません (YAMLにのみ残っています)'; lb.append(m);
       }
-      row.append(cb, lb); det.append(row);
+      const descbox = document.createElement('div'); descbox.className = 'descbox';
+      descbox.hidden = !SEL.has(e.id);
+      const ta = document.createElement('textarea');
+      ta.rows = 2; ta.maxLength = 1000;
+      ta.placeholder = '説明 (この entity が何なのかを自然言語で)';
+      ta.value = DESC[e.id] || '';
+      ta.oninput = () => { DESC[e.id] = ta.value; };
+      const hint = document.createElement('div'); hint.className = 'hint';
+      hint.textContent = 'この説明は description の値として保存され、Muse にそのまま渡ります (最大1000文字)';
+      descbox.append(ta, hint);
+      row.append(cb, lb, descbox); det.append(row);
     }
     list.append(det);
   }
@@ -105,8 +123,9 @@ $('#onlySel').onchange = render;
 $('#save').onclick = async () => {
   const b = $('#save'); b.disabled = true; $('#msg').textContent = '保存中…';
   try {
+    const descriptions = {}; for (const id of SEL) descriptions[id] = DESC[id] || '';
     const r = await fetch('api/save', {method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({selected: [...SEL]})});
+      body: JSON.stringify({selected: [...SEL], descriptions})});
     if (!r.ok) throw new Error(await r.text());
     const d = await r.json();
     $('#msg').textContent = d.count + ' 件を保存しました';
