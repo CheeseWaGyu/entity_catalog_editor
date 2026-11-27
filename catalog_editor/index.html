@@ -39,14 +39,14 @@ button{background:var(--accent);color:#fff;border:0;border-radius:8px;padding:10
 <main id="list"></main>
 <footer><span id="msg"></span><button id="save">保存</button></footer>
 <script>
-let ALL = [], SEL = new Set(), WARN = [], DESC = {}, HIST = {}, FULLWARN = [];
+let ALL = [], SEL = new Set(), WARN = [], DESC = {}, HIST = {}, FULLWARN = [], PRIVWARN = [];
 const $ = s => document.querySelector(s);
 const domain = id => id.split('.')[0];
 
 async function init() {
   const r = await fetch('api/entities');
   const d = await r.json();
-  ALL = d.entities; WARN = d.warn_domains; FULLWARN = d.history_full_warn_domains || []; SEL = new Set(d.selected);
+  ALL = d.entities; WARN = d.warn_domains; FULLWARN = d.history_full_warn_domains || []; PRIVWARN = d.history_privacy_warn_domains || []; SEL = new Set(d.selected);
   DESC = {}; for (const e of ALL) DESC[e.id] = e.description || '';
   HIST = {}; for (const e of ALL) HIST[e.id] = e.history || 'off';
   $('#path').textContent = d.path.split('/').slice(-2).join('/');
@@ -121,8 +121,15 @@ function render() {
       }
       hsel.value = HIST[e.id] || 'off';
       const hw = document.createElement('span'); hw.className = 'warn';
-      hw.textContent = 'full: 位置情報などの生ログが AI に渡ります';
-      const updHw = () => { hw.hidden = !(hsel.value === 'full' && FULLWARN.includes(dom)); };
+      const updHw = () => {
+        const msgs = [];
+        if (PRIVWARN.includes(dom) && (hsel.value === 'summary' || hsel.value === 'full'))
+          msgs.push('summary でも滞在時間・遷移時刻から行動パターンが推測できます');
+        if (hsel.value === 'full' && FULLWARN.includes(dom))
+          msgs.push('full: 位置情報などの生ログが AI に渡ります');
+        hw.textContent = msgs.join(' / ');
+        hw.hidden = msgs.length === 0;
+      };
       hsel.onchange = () => { HIST[e.id] = hsel.value; updHw(); };
       updHw();
       histbox.append(hl, hsel, hw);

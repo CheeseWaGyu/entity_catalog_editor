@@ -19,10 +19,78 @@ HA = "http://supervisor/core/api"
 HEADERS = {"Authorization": "Bearer " + os.environ.get("SUPERVISOR_TOKEN", "")}
 WARN_DOMAINS = ["lock", "cover", "alarm_control_panel"]
 # 履歴 level が full のとき特に注意が要るドメイン（位置情報などの生ログが渡る）
-HISTORY_FULL_WARN_DOMAINS = ["device_tracker", "person"]
+HISTORY_FULL_WARN_DOMAINS = ["device_tracker", "person", "camera"]
+# summary でも滞在時間・遷移時刻から行動パターンが推測できるドメイン
+HISTORY_PRIVACY_WARN_DOMAINS = ["device_tracker", "person"]
 HISTORY_LEVELS = ["off", "summary", "full"]
 DEFAULT_HEADER = "# entity_catalog.yaml (Entity Catalog Editor で生成)\n"
 MAX_DESCRIPTION_LEN = 1000  # ha-muse-automation-mcp 側の上限と一致させる
+# entity_id の厳格な形式（HA の規則: 小文字ドメイン . 小文字 object_id）
+ENTITY_ID_RE = re.compile(r"^[a-z][a-z0-9_]*\.[a-z0-9_]+$")
+MAX_SELECTED = 1000  # 1回の保存で扱う entity 数の上限（descriptions / history の件数上限も同じ）
+MAX_BODY_SIZE = 1024 * 1024  # リクエストボディ上限 1MB（aiohttp client_max_size）
+
+
+def is_valid_entity_id(value):
+    return isinstance(value, str) and bool(ENTITY_ID_RE.match(value))
+
+
+class SaveValidationError(ValueError):
+    """保存リクエストの検証エラー。invalid に問題のある ID を入れる。"""
+
+    def __init__(self, message, invalid=None):
+        super().__init__(message)
+        self.invalid = invalid or []
+
+
+def validate_save_payload(body, known_ids):
+    """保存ペイロードを検証し、正規化済みの (selected, descriptions, history_levels) を返す。
+
+    selected / descriptions のキー / history のキーはすべて、形式が正しく、
+    かつ HA に実在するか既存カタログに載っている ID でなければならない。
+    問題があれば SaveValidationError（HTTP 400 相当）を送出する（黙って落とさない）。
+    """
+    if not isinstance(body, dict):
+        raise SaveValidationError("リクエストボディは JSON オブジェクトです")
+    raw_selected = body.get("selected", [])
+    if not isinstance(raw_selected, list):
+        raise SaveValidationError("selected はリストです")
+    invalid = []
+    selected = []
+    for s in raw_selected:
+        if not is_valid_entity_id(s):
+            invalid.append(s if isinstance(s, str) else repr(s))
+        elif s not in known_ids:
+            invalid.append(s)
+        elif s not in selected:
+            selected.append(s)
+    if invalid:
+        raise SaveValidationError("selected に不正な entity_id があります", invalid)
+    if len(selected) > MAX_SELECTED:
+        raise SaveValidationError(f"selected は {MAX_SELECTED} 件までです")
+    selected.sort()
+
+    def clean_map(raw, name):
+        if raw is None:
+            return {}
+        if not isinstance(raw, dict):
+            raise SaveValidationError(f"{name} はオブジェクトです")
+        if len(raw) > MAX_SELECTED:
+            raise SaveValidationError(f"{name} は {MAX_SELECTED} 件までです")
+        bad = [k for k in raw if not is_valid_entity_id(k) or k not in known_ids]
+        if bad:
+            raise SaveValidationError(f"{name} に不正な entity_id があります", bad)
+        return raw
+
+    descriptions = {
+        k: clean_description(v)
+        for k, v in clean_map(body.get("descriptions"), "descriptions").items()
+    }
+    history_levels = {
+        k: clean_history_level(v)
+        for k, v in clean_map(body.get("history"), "history").items()
+    }
+    return selected, descriptions, history_levels
 
 
 def clean_history_level(value):
@@ -77,6 +145,10 @@ def one_line(value):
 
 
 def render(selected, old, names, text, data, descriptions=None, history_levels=None):
+    # 防御: render には検証済み ID しか渡さない（万一のときはここでも止める）
+    for eid in selected:
+        if not is_valid_entity_id(eid):
+            raise SaveValidationError("render に未検証の entity_id が渡されました", [eid])
     # 既存ファイルの先頭コメントを引き継ぐ
     header = []
     for line in text.splitlines():
@@ -141,6 +213,7 @@ async def entities(request):
             "path": PATH,
             "warn_domains": WARN_DOMAINS,
             "history_full_warn_domains": HISTORY_FULL_WARN_DOMAINS,
+            "history_privacy_warn_domains": HISTORY_PRIVACY_WARN_DOMAINS,
             "selected": sorted(old),
             "entities": [
                 {
@@ -157,18 +230,19 @@ async def entities(request):
 
 
 async def save(request):
-    body = await request.json()
-    selected = sorted({s for s in body.get("selected", []) if isinstance(s, str)})
-    raw_desc = body.get("descriptions") or {}
-    descriptions = {
-        k: clean_description(v) for k, v in raw_desc.items() if isinstance(k, str)
-    }
-    raw_hist = body.get("history") or {}
-    history_levels = {
-        k: clean_history_level(v) for k, v in raw_hist.items() if isinstance(k, str)
-    }
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "リクエストボディが JSON ではありません"},
+                                 status=400)
     names = await fetch_names()
     text, data = load_raw()
+    known_ids = set(names) | set(old_entities(data))
+    try:
+        selected, descriptions, history_levels = validate_save_payload(body, known_ids)
+    except SaveValidationError as e:
+        return web.json_response(
+            {"ok": False, "error": str(e), "invalid": e.invalid}, status=400)
     content = render(selected, old_entities(data), names, text, data, descriptions, history_levels)
     yaml.safe_load(content)  # 書く前に壊れていないか検証
     if os.path.exists(PATH):
@@ -180,7 +254,7 @@ async def save(request):
     return web.json_response({"ok": True, "count": len(selected)})
 
 
-app = web.Application()
+app = web.Application(client_max_size=MAX_BODY_SIZE)
 app.add_routes([web.get("/", index), web.get("/api/entities", entities), web.post("/api/save", save)])
 
 if __name__ == "__main__":
