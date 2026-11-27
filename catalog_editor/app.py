@@ -1,10 +1,14 @@
 import json
+import logging
 import os
 import re
 import shutil
+from pathlib import Path
 
 import yaml
 from aiohttp import ClientSession, web
+
+log = logging.getLogger("catalog_editor")
 
 OPTS = {}
 if os.path.exists("/data/options.json"):
@@ -15,6 +19,35 @@ PATH = OPTS.get(
     "catalog_path",
     "/addon_configs/959b8912_muse_automation_mcp/entity_catalog.yaml",
 )
+# 書き込み先の許可範囲（v0.2.2、監査対応）: catalog_path は設定値をそのまま
+# 信頼せず、解決済みパスが「許可ルート内・ファイル名は entity_catalog.yaml・
+# 直上のディレクトリが Muse Automation MCP の設定ディレクトリ」の全てを
+# 満たす場合だけ読み書きする。all_addon_configs:rw を持つ以上、設定ミスや
+# 改変で想定外のファイルを上書きしないためのコード側の歯止め。
+# CATALOG_ALLOWED_ROOT はテストが tmp ディレクトリへ向けるための上書きで、
+# 本番（アドオン）では未設定＝既定の /addon_configs を使う。
+ALLOWED_ROOT = os.environ.get("CATALOG_ALLOWED_ROOT", "/addon_configs")
+CATALOG_FILENAME = "entity_catalog.yaml"
+
+
+def catalog_path_error(path=None):
+    """catalog_path が許可範囲外なら理由文字列、問題なければ None を返す。"""
+    p = Path(PATH if path is None else path).resolve()
+    root = Path(ALLOWED_ROOT).resolve()
+    if p.name != CATALOG_FILENAME:
+        return f"ファイル名は {CATALOG_FILENAME} でなければなりません: {p}"
+    if root not in p.parents:
+        return f"許可ルート {root} の外にあります: {p}"
+    parent = p.parent.name
+    if parent != "muse_automation_mcp" and not parent.endswith("_muse_automation_mcp"):
+        return f"Muse Automation MCP の設定ディレクトリ直下ではありません: {p.parent}"
+    return None
+
+
+PATH_ERROR = catalog_path_error()
+if PATH_ERROR:
+    log.error("catalog_path が許可範囲外のため、カタログの読み書きを無効化します: %s",
+              PATH_ERROR)
 HA = "http://supervisor/core/api"
 HEADERS = {"Authorization": "Bearer " + os.environ.get("SUPERVISOR_TOKEN", "")}
 WARN_DOMAINS = ["lock", "cover", "alarm_control_panel"]
@@ -41,6 +74,10 @@ class SaveValidationError(ValueError):
     def __init__(self, message, invalid=None):
         super().__init__(message)
         self.invalid = invalid or []
+
+
+class CatalogPathError(RuntimeError):
+    """catalog_path が許可範囲外のため書き込みを拒否する（ファイルは開かない）。"""
 
 
 def validate_save_payload(body, known_ids):
@@ -113,12 +150,40 @@ def clean_description(value):
 
 
 def load_raw():
+    if catalog_path_error():
+        return "", {}
     try:
         with open(PATH, encoding="utf-8") as f:
             text = f.read()
     except FileNotFoundError:
         return "", {}
     return text, (yaml.safe_load(text) or {})
+
+
+def write_catalog(content):
+    """検証済みコンテンツをカタログへ書く（.tmp へ書いてから os.replace で差し替え）。
+
+    catalog_path が許可範囲外なら CatalogPathError を送出し、ファイルには
+    一切触れない。書き込みや差し替えに失敗した場合は例外をそのまま伝播させ、
+    既存カタログは元のまま残る（一時ファイルは掃除する）。差し替え前に
+    PATH + ".bak" へバックアップを取る（従来動作）。
+    """
+    err = catalog_path_error()
+    if err:
+        raise CatalogPathError(err)
+    if os.path.exists(PATH):
+        shutil.copy2(PATH, PATH + ".bak")
+    tmp = PATH + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(content)
+        os.replace(tmp, PATH)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def old_entities(data):
@@ -245,12 +310,13 @@ async def save(request):
             {"ok": False, "error": str(e), "invalid": e.invalid}, status=400)
     content = render(selected, old_entities(data), names, text, data, descriptions, history_levels)
     yaml.safe_load(content)  # 書く前に壊れていないか検証
-    if os.path.exists(PATH):
-        shutil.copy2(PATH, PATH + ".bak")
-    tmp = PATH + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(content)
-    os.replace(tmp, PATH)
+    try:
+        write_catalog(content)
+    except CatalogPathError as e:
+        return web.json_response(
+            {"ok": False,
+             "error": f"catalog_path が許可範囲外のため保存できません（catalog_path not allowed）: {e}"},
+            status=500)
     return web.json_response({"ok": True, "count": len(selected)})
 
 

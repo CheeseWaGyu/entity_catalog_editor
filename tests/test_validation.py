@@ -5,7 +5,9 @@ import する前に aiohttp モジュールを sys.modules にスタブとして
 （app.py はモジュールレベルで `from aiohttp import ClientSession, web` し、
 末尾で web.Application を生成するため、その生成に必要な最小限を用意する）。
 """
+import asyncio
 import importlib.util
+import os
 import sys
 import types
 from pathlib import Path
@@ -37,7 +39,12 @@ def _install_aiohttp_stub():
 
     web.Application = _Application
     web.Response = object
-    web.json_response = lambda *a, **k: None
+
+    def _json_response(data=None, status=200, **kwargs):
+        # ハンドラのテストで status と本文を検証できるよう、最小限の応答オブジェクトを返す
+        return types.SimpleNamespace(status=status, data=data)
+
+    web.json_response = _json_response
     web.get = lambda path, handler: ("GET", path, handler)
     web.post = lambda path, handler: ("POST", path, handler)
     web.run_app = lambda *a, **k: None
@@ -163,3 +170,114 @@ def test_render_history_level_override_and_off_omission():
 def test_render_rejects_unvalidated_id():
     with pytest.raises(app.SaveValidationError):
         app.render(["sensor.living_temp; rm -rf"], {}, {}, "", {"entities": []})
+
+
+# ------------------------------------------------------------------
+# catalog_path の許可範囲（v0.2.2）: 検証そのものと、保存失敗時の原子性。
+# ハンドラ（app.save）を直接呼ぶため、fetch_names はスタブに差し替え、
+# PATH / ALLOWED_ROOT は tmp ディレクトリへ向ける。
+# ------------------------------------------------------------------
+
+INITIAL_CATALOG = (
+    "entities:\n"
+    "  - entity_id: sensor.living_temp\n"
+    "    area: リビング\n"
+    "    tags: []\n"
+)
+
+
+class _FakeRequest:
+    def __init__(self, body):
+        self._body = body
+
+    async def json(self):
+        return self._body
+
+
+@pytest.fixture
+def editor_env(tmp_path, monkeypatch):
+    cfg_dir = tmp_path / "959b8912_muse_automation_mcp"
+    cfg_dir.mkdir()
+    catalog = cfg_dir / "entity_catalog.yaml"
+    catalog.write_text(INITIAL_CATALOG, encoding="utf-8")
+    monkeypatch.setattr(app, "PATH", str(catalog))
+    monkeypatch.setattr(app, "ALLOWED_ROOT", str(tmp_path))
+
+    async def fake_fetch_names():
+        return {"sensor.living_temp": "Living Temp"}
+
+    monkeypatch.setattr(app, "fetch_names", fake_fetch_names)
+    return catalog
+
+
+def test_catalog_path_validation(tmp_path, monkeypatch):
+    monkeypatch.setattr(app, "ALLOWED_ROOT", str(tmp_path))
+    good = tmp_path / "959b8912_muse_automation_mcp" / "entity_catalog.yaml"
+    assert app.catalog_path_error(str(good)) is None
+    bare = tmp_path / "muse_automation_mcp" / "entity_catalog.yaml"
+    assert app.catalog_path_error(str(bare)) is None
+    # ファイル名が違う
+    assert app.catalog_path_error(
+        str(tmp_path / "959b8912_muse_automation_mcp" / "other.yaml")) is not None
+    # 直上のディレクトリが MCP の設定ディレクトリでない
+    assert app.catalog_path_error(
+        str(tmp_path / "some_other_addon" / "entity_catalog.yaml")) is not None
+    # 許可ルートの外
+    monkeypatch.setattr(app, "ALLOWED_ROOT", str(tmp_path / "root"))
+    assert app.catalog_path_error(str(good)) is not None
+
+
+def test_save_success_writes_catalog(editor_env):
+    catalog = editor_env
+    resp = asyncio.run(app.save(_FakeRequest(
+        {"selected": ["sensor.living_temp"],
+         "descriptions": {"sensor.living_temp": "リビングの室温"}})))
+    assert resp.status == 200 and resp.data["ok"] is True
+    parsed = yaml.safe_load(catalog.read_text(encoding="utf-8"))
+    assert parsed["entities"][0]["description"] == "リビングの室温"
+    assert Path(str(catalog) + ".bak").exists()  # 差し替え前にバックアップ
+
+
+def test_save_invalid_payload_writes_nothing(editor_env):
+    catalog = editor_env
+    before = catalog.read_bytes()
+    resp = asyncio.run(app.save(_FakeRequest({"selected": ["sensor.unknown_thing"]})))
+    assert resp.status == 400 and resp.data["ok"] is False
+    assert catalog.read_bytes() == before  # 既存カタログはバイト単位で不変
+    assert not Path(str(catalog) + ".tmp").exists()
+
+
+def test_save_replace_failure_keeps_original(editor_env, monkeypatch):
+    catalog = editor_env
+    before = catalog.read_bytes()
+
+    def failing_replace(src, dst):
+        raise OSError("simulated disk failure")
+
+    monkeypatch.setattr(os, "replace", failing_replace)
+    with pytest.raises(OSError):
+        asyncio.run(app.save(_FakeRequest({"selected": ["sensor.living_temp"]})))
+    assert catalog.read_bytes() == before  # 差し替え失敗でも原文は無傷
+    assert not Path(str(catalog) + ".tmp").exists()  # 一時ファイルは掃除される
+
+
+def test_save_disallowed_path_refused(editor_env, tmp_path, monkeypatch):
+    # 許可範囲外（直上が MCP の設定ディレクトリでない）へは書かない
+    elsewhere_dir = tmp_path / "some_other_addon"
+    elsewhere_dir.mkdir()
+    target = elsewhere_dir / "entity_catalog.yaml"
+    target.write_text(INITIAL_CATALOG, encoding="utf-8")
+    monkeypatch.setattr(app, "PATH", str(target))
+    before = target.read_bytes()
+    resp = asyncio.run(app.save(_FakeRequest({"selected": ["sensor.living_temp"]})))
+    assert resp.status == 500 and resp.data["ok"] is False
+    assert "catalog_path" in resp.data["error"]
+    assert target.read_bytes() == before
+
+
+def test_write_catalog_disallowed_path_raises(tmp_path, monkeypatch):
+    monkeypatch.setattr(app, "ALLOWED_ROOT", str(tmp_path))
+    monkeypatch.setattr(app, "PATH", str(tmp_path / "evil" / "entity_catalog.yaml"))
+    with pytest.raises(app.CatalogPathError):
+        app.write_catalog("entities: []\n")
+    assert not (tmp_path / "evil").exists()  # ディレクトリすら作らない
