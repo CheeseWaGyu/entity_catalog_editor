@@ -23,6 +23,8 @@ summary .n{font-weight:400;color:var(--mute);font-size:13px}
 .descbox{flex-basis:100%;margin-left:30px}
 .descbox textarea{width:100%;padding:7px 9px;font-size:14px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--fg);resize:vertical}
 .descbox .hint{font-size:12px;color:var(--mute);margin-top:2px}
+.histbox{margin-top:6px;font-size:13px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.histbox select{padding:5px 7px;font-size:14px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--fg)}
 .tog{padding:6px 12px;font-size:13px;color:var(--accent);cursor:pointer;border-top:1px solid var(--line)}
 footer{position:fixed;bottom:0;left:0;right:0;padding:10px 12px;background:var(--card);border-top:1px solid var(--line);display:flex;justify-content:space-between;align-items:center;gap:10px}
 button{background:var(--accent);color:#fff;border:0;border-radius:8px;padding:10px 20px;font-size:15px;font-weight:600}
@@ -37,15 +39,16 @@ button{background:var(--accent);color:#fff;border:0;border-radius:8px;padding:10
 <main id="list"></main>
 <footer><span id="msg"></span><button id="save">保存</button></footer>
 <script>
-let ALL = [], SEL = new Set(), WARN = [], DESC = {};
+let ALL = [], SEL = new Set(), WARN = [], DESC = {}, HIST = {}, FULLWARN = [];
 const $ = s => document.querySelector(s);
 const domain = id => id.split('.')[0];
 
 async function init() {
   const r = await fetch('api/entities');
   const d = await r.json();
-  ALL = d.entities; WARN = d.warn_domains; SEL = new Set(d.selected);
+  ALL = d.entities; WARN = d.warn_domains; FULLWARN = d.history_full_warn_domains || []; SEL = new Set(d.selected);
   DESC = {}; for (const e of ALL) DESC[e.id] = e.description || '';
+  HIST = {}; for (const e of ALL) HIST[e.id] = e.history || 'off';
   $('#path').textContent = d.path.split('/').slice(-2).join('/');
   render();
 }
@@ -109,6 +112,21 @@ function render() {
       const hint = document.createElement('div'); hint.className = 'hint';
       hint.textContent = 'この説明は description の値として保存され、Muse にそのまま渡ります (最大1000文字)';
       descbox.append(ta, hint);
+      const histbox = document.createElement('div'); histbox.className = 'histbox';
+      const hl = document.createElement('span'); hl.textContent = '履歴 (証拠):';
+      const hsel = document.createElement('select');
+      for (const lv of ['off', 'summary', 'full']) {
+        const o = document.createElement('option'); o.value = lv; o.textContent = lv;
+        hsel.append(o);
+      }
+      hsel.value = HIST[e.id] || 'off';
+      const hw = document.createElement('span'); hw.className = 'warn';
+      hw.textContent = 'full: 位置情報などの生ログが AI に渡ります';
+      const updHw = () => { hw.hidden = !(hsel.value === 'full' && FULLWARN.includes(dom)); };
+      hsel.onchange = () => { HIST[e.id] = hsel.value; updHw(); };
+      updHw();
+      histbox.append(hl, hsel, hw);
+      descbox.append(histbox);
       row.append(cb, lb, descbox); det.append(row);
     }
     list.append(det);
@@ -124,8 +142,9 @@ $('#save').onclick = async () => {
   const b = $('#save'); b.disabled = true; $('#msg').textContent = '保存中…';
   try {
     const descriptions = {}; for (const id of SEL) descriptions[id] = DESC[id] || '';
+    const history = {}; for (const id of SEL) history[id] = HIST[id] || 'off';
     const r = await fetch('api/save', {method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({selected: [...SEL], descriptions})});
+      body: JSON.stringify({selected: [...SEL], descriptions, history})});
     if (!r.ok) throw new Error(await r.text());
     const d = await r.json();
     $('#msg').textContent = d.count + ' 件を保存しました';

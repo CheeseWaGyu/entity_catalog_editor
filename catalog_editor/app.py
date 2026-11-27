@@ -18,8 +18,23 @@ PATH = OPTS.get(
 HA = "http://supervisor/core/api"
 HEADERS = {"Authorization": "Bearer " + os.environ.get("SUPERVISOR_TOKEN", "")}
 WARN_DOMAINS = ["lock", "cover", "alarm_control_panel"]
+# 履歴 level が full のとき特に注意が要るドメイン（位置情報などの生ログが渡る）
+HISTORY_FULL_WARN_DOMAINS = ["device_tracker", "person"]
+HISTORY_LEVELS = ["off", "summary", "full"]
 DEFAULT_HEADER = "# entity_catalog.yaml (Entity Catalog Editor で生成)\n"
 MAX_DESCRIPTION_LEN = 1000  # ha-muse-automation-mcp 側の上限と一致させる
+
+
+def clean_history_level(value):
+    """history.level を正規化する（不正値は off に倒す。サーバー側の解析と一致）。"""
+    return value if value in HISTORY_LEVELS else "off"
+
+
+def entity_history_level(entry):
+    hist = entry.get("history")
+    if isinstance(hist, dict):
+        return clean_history_level(hist.get("level"))
+    return "off"
 
 
 def clean_description(value):
@@ -61,7 +76,7 @@ def one_line(value):
     return yaml.safe_dump(value, default_flow_style=True, width=10**6).split("\n")[0]
 
 
-def render(selected, old, names, text, data, descriptions=None):
+def render(selected, old, names, text, data, descriptions=None, history_levels=None):
     # 既存ファイルの先頭コメントを引き継ぐ
     header = []
     for line in text.splitlines():
@@ -89,8 +104,19 @@ def render(selected, old, names, text, data, descriptions=None):
         out.append("    area: " + (one_line(area) if area else ""))
         tags = e.get("tags") or []
         out.append("    tags: " + yaml.safe_dump(tags, default_flow_style=True, width=10**6).strip())
-        for k, v in e.items():  # area/tags/description 以外の独自キーも保持
-            if k in ("entity_id", "area", "tags", "description"):
+        # 履歴（証拠レイヤー）: level が off 以外のときだけ history: を値として書く。
+        # UI から送られた level を優先し、無ければ既存ファイルの値を引き継ぐ。
+        # 既存の history.attributes（許可属性リスト）はそのまま保持する。
+        old_hist = e.get("history") if isinstance(e.get("history"), dict) else {}
+        level = clean_history_level((history_levels or {}).get(eid, old_hist.get("level")))
+        if level != "off":
+            out.append("    history:")
+            out.append(f"      level: {level}")
+            attrs = old_hist.get("attributes")
+            if isinstance(attrs, list) and attrs:
+                out.append("      attributes: " + yaml.safe_dump(attrs, default_flow_style=True, width=10**6).strip())
+        for k, v in e.items():  # area/tags/description/history 以外の独自キーも保持
+            if k in ("entity_id", "area", "tags", "description", "history"):
                 continue
             for ln in yaml.safe_dump({k: v}, allow_unicode=True).splitlines():
                 out.append("    " + ln)
@@ -114,6 +140,7 @@ async def entities(request):
         {
             "path": PATH,
             "warn_domains": WARN_DOMAINS,
+            "history_full_warn_domains": HISTORY_FULL_WARN_DOMAINS,
             "selected": sorted(old),
             "entities": [
                 {
@@ -121,6 +148,7 @@ async def entities(request):
                     "name": names.get(i, ""),
                     "missing": i not in names,
                     "description": clean_description(old.get(i, {}).get("description")),
+                    "history": entity_history_level(old.get(i, {})),
                 }
                 for i in ids
             ],
@@ -135,9 +163,13 @@ async def save(request):
     descriptions = {
         k: clean_description(v) for k, v in raw_desc.items() if isinstance(k, str)
     }
+    raw_hist = body.get("history") or {}
+    history_levels = {
+        k: clean_history_level(v) for k, v in raw_hist.items() if isinstance(k, str)
+    }
     names = await fetch_names()
     text, data = load_raw()
-    content = render(selected, old_entities(data), names, text, data, descriptions)
+    content = render(selected, old_entities(data), names, text, data, descriptions, history_levels)
     yaml.safe_load(content)  # 書く前に壊れていないか検証
     if os.path.exists(PATH):
         shutil.copy2(PATH, PATH + ".bak")
